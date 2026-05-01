@@ -1,73 +1,91 @@
 # Bot extractor de player (m3u8 + subtítulos dinámicos)
 
 ## Qué resuelve
-Este bot reemplaza el enfoque con `curl` y usa SecretAgent para ejecutar JS real de la página. Así puede capturar:
+Este bot reemplaza `curl` y usa SecretAgent (navegador real) para capturar:
+- `videoUrl` (`.m3u8`)
+- subtítulos dinámicos (`.vtt` / `.srt`)
 
-- URL final de video `.m3u8`.
-- Subtítulos dinámicos `.vtt` o `.srt` cargados después del render.
+También mejora el matching de episodios para evitar duplicados (capítulos repetidos) y añade un paso clave para páginas con bloques `1-10`, `11-20`, etc.: primero selecciona bloque y luego episodio.
 
-Además, mejora la selección de episodios para evitar repetición de capítulos (ejemplo: 3-1, 3-2, 3-3, etc.) porque busca y puntúa múltiples atributos (`textContent`, `href`, `data-episode`, `data-id`).
+## Archivos
+- `examples/anime-player-builder.js` (bot VPS)
+- Snippet de integración Worker/Nitro (abajo)
 
-## Archivo
-- `examples/anime-player-builder.js`
-
-## API HTTP esperada
-`POST /` con JSON:
-
+## API del bot VPS
+`POST /`:
 ```json
-{
-  "url": "https://sitio-clon-anime.com/serie/black-clover/temporada-3",
-  "ep": "3-2"
-}
+{ "url": "https://sitio/serie/temporada-3", "ep": "3-2" }
 ```
 
 Respuesta:
-
 ```json
 {
   "ok": true,
-  "videoUrl": "https://cdn.../master.m3u8",
-  "subtitles": [
-    {
-      "label": "es latin",
-      "src": "https://cdn.../es-latin.vtt",
-      "srclang": "es"
-    }
-  ]
+  "videoUrl": "https://cdn/video/master.m3u8",
+  "subtitles": [{ "label": "es latin", "src": "https://cdn/es.vtt", "srclang": "es" }]
 }
 ```
 
-## Integración con Cloudflare Worker
-Tu Worker debe seguir como puente:
+## Montaje recomendado (Cloudflare + VPS)
+1. **VPS**: ejecuta el bot SecretAgent (no corre dentro de Worker).
+2. **Cloudflare Worker**: recibe del frontend, consulta KV, y si no hay caché hace `fetch` al VPS.
+3. **Frontend**: solo consulta tu endpoint del Worker.
 
-1. Recibe request del frontend.
-2. Valida parámetros.
-3. Consulta KV cache con llave: `anime:${url}:${ep}`.
-4. Si no existe, hace `fetch` POST a tu VPS (`http://TU_VPS:3000`).
-5. Guarda respuesta en KV (TTL 5-30 min).
-6. Devuelve JSON al frontend.
+## Cómo conectarlo a tu API actual
+Usa el snippet de abajo para migrar de `embed` a:
+- `videoUrl`
+- `subtitles`
 
-## Dónde montarlo
-Como SecretAgent necesita navegador real, **no** corre dentro de Cloudflare Workers. Opciones recomendadas:
+Compatibilidad sugerida temporal:
+- devolver también `embed: videoUrl` en tu API final mientras actualizas frontend.
 
-- VPS (Hetzner, Contabo, DigitalOcean, OVH).
-- Railway con instancia dedicada + memoria suficiente.
-- Render background service (si permite Chromium dependencias).
-- Tu actual JustRunMyApp si soporta proceso largo + dependencias del navegador.
-
-## Ejecución en VPS
+## Deploy rápido
+### VPS
 ```bash
 npm install
 node examples/anime-player-builder.js
 ```
+Variables:
+- `PORT=3000`
+- `HOST=0.0.0.0`
+- `REQUEST_TIMEOUT_MS=45000`
 
-Variables opcionales:
-- `PORT` (default `3000`)
-- `HOST` (default `0.0.0.0`)
-- `REQUEST_TIMEOUT_MS` (default `45000`)
+### Cloudflare Worker (Wrangler)
+```bash
+npm i -D wrangler
+npx wrangler login
+npx wrangler kv namespace create ANIME_CACHE
+```
+En `wrangler.toml` enlaza el KV namespace y despliega:
+```bash
+npx wrangler deploy
+```
 
-## Nota de robustez para animes largos
-Para catálogos con cientos de episodios:
-- Mantén timeout de 45s-60s.
-- Haz caché por episodio en Worker KV.
-- Si el sitio usa paginación por bloques (1-10, 11-20), primero selecciona el bloque por rango y luego episodio exacto (puedes extender `findEpisodeCandidate` con ese paso).
+## Recomendaciones anti-errores en animes largos
+- TTL de KV por episodio (`anime:url:ep`) entre 10 y 30 min.
+- Timeout del bot entre 45s y 60s.
+- Retries (1-2) desde Worker al VPS cuando falle por red.
+- Si el sitio cambia HTML, ajustar selectores en `clickEpisodeGroupIfNeeded` y `findEpisodeCandidate`.
+
+
+## Snippet Worker/Nitro (adaptación de tu archivo actual)
+```ts
+const BOT_URL = "https://TU-BOT-VPS.com";
+// ... mantiene tu flujo KV -> seeke -> bot -> fallback
+const botRes = await fetch(BOT_URL, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ url: baseUrl, ep: String(ep) }),
+});
+const data = await botRes.json();
+if (data?.ok && data.videoUrl?.includes(".m3u8")) {
+  return {
+    ok: true,
+    episode: String(ep),
+    videoUrl: data.videoUrl,
+    embed: data.videoUrl, // compat temporal con frontend viejo
+    subtitles: data.subtitles ?? [],
+    source: "bot",
+  };
+}
+```

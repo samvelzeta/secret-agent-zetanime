@@ -60,14 +60,49 @@ async function findEpisodeCandidate(agent, episodeInput) {
   return null;
 }
 
+
+function extractEpisodeNumber(value) {
+  const normalized = normalizeEpisodeKey(value);
+  const match = normalized.match(/(\d+)(?:[-x_.](\d+))?$/i);
+  if (!match) return null;
+  return {
+    season: match[2] ? Number(match[1]) : null,
+    episode: Number(match[2] || match[1]),
+  };
+}
+
+function inRangeLabel(label, episode) {
+  const text = String(label ?? '').trim();
+  const range = text.match(/^(\d+)\s*[-–]\s*(\d+)$/);
+  if (!range) return false;
+  const start = Number(range[1]);
+  const end = Number(range[2]);
+  return Number.isFinite(start) && Number.isFinite(end) && episode >= start && episode <= end;
+}
+
+async function clickEpisodeGroupIfNeeded(agent, episodeInput) {
+  const parsed = extractEpisodeNumber(episodeInput);
+  if (!parsed?.episode) return false;
+
+  const groupButtons = await agent.document.querySelectorAll('a, button, li, [role="button"], .page-item, .episode-range');
+  for (const node of groupButtons) {
+    const text = await node.textContent;
+    if (inRangeLabel(text, parsed.episode)) {
+      await node.click();
+      await agent.waitForMillis(1200);
+      return true;
+    }
+  }
+
+  return false;
+}
+
 async function scrapePlayerConfig(baseUrl, episode) {
   const agent = await SecretAgent();
   const subtitlesMap = new Map();
   let videoUrl = null;
 
   try {
-    const fullUrl = new URL(String(episode), baseUrl).toString();
-
     agent.on('resource', resource => {
       const url = resource.url || '';
       const lower = url.toLowerCase();
@@ -92,6 +127,7 @@ async function scrapePlayerConfig(baseUrl, episode) {
     });
 
     await agent.goto(baseUrl);
+    await clickEpisodeGroupIfNeeded(agent, episode);
     await findEpisodeCandidate(agent, episode);
     await agent.waitForMillis(5000);
 
